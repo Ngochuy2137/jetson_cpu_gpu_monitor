@@ -1,7 +1,6 @@
 # Jetson CPU/GPU Monitor
 
-Log CPU and GPU usage to an Excel file. CPU sampling uses the same approach as
-`main_controller` (`psutil.cpu_percent(interval=0, percpu=True)`).
+Log CPU and GPU usage to an Excel file. CPU sampling uses `psutil.cpu_percent(interval=0, percpu=True)`.
 
 ## Install
 
