@@ -4,6 +4,7 @@ Log CPU and GPU usage to an Excel file on Jetson (or any Linux host with psutil)
 
 CPU sampling follows main_controller/observer.py:
   psutil.cpu_percent(interval=0, percpu=True)
+  psutil.virtual_memory().percent
 
 GPU load is read from Jetson sysfs (value / 10 = percent).
 """
@@ -65,6 +66,11 @@ def read_gpu_percent(gpu_load_path: Path | None) -> float | None:
 
 def get_cpu_per_core() -> list[float]:
     return list(psutil.cpu_percent(interval=0, percpu=True))
+
+
+def get_ram_percent() -> float:
+    """Same metric as main_controller/observer.py: psutil.virtual_memory().percent."""
+    return psutil.virtual_memory().percent
 
 
 def count_cores_above(per_core: list[float], threshold: float) -> int:
@@ -134,9 +140,19 @@ def main() -> int:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "monitor"
-    sheet.append(["timestamp", "cpu_avg_pct", "gpu_pct", cores_col])
+    duration_text = "until Ctrl+C" if args.duration <= 0 else f"{args.duration:g}s"
+    sheet.append(
+        [
+            "RUN_PARAMS",
+            f"--hz={args.hz:g}",
+            f"--threshold={args.threshold:g}",
+            f"duration={duration_text}",
+            "",
+        ]
+    )
+    sheet.append(["timestamp", "cpu_avg_pct", "gpu_pct", "ram_pct", cores_col])
 
-    rows: list[tuple[str, float, float | None, int]] = []
+    rows: list[tuple[str, float, float | None, float, int]] = []
     start = time.monotonic()
     next_sample = start
     sample_count = 0
@@ -159,10 +175,11 @@ def main() -> int:
             per_core = get_cpu_per_core()
             cpu_avg = statistics.fmean(per_core) if per_core else 0.0
             gpu_pct = read_gpu_percent(gpu_load_path)
+            ram_pct = get_ram_percent()
             cores_above = count_cores_above(per_core, args.threshold)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-            rows.append((timestamp, cpu_avg, gpu_pct, cores_above))
+            rows.append((timestamp, cpu_avg, gpu_pct, ram_pct, cores_above))
             sample_count += 1
             next_sample += interval
 
@@ -170,19 +187,40 @@ def main() -> int:
                 gpu_text = "n/a" if gpu_pct is None else f"{gpu_pct:.1f}"
                 print(
                     f"[{timestamp}] cpu_avg={cpu_avg:.1f}% gpu={gpu_text}% "
-                    f"{cores_col}={cores_above}"
+                    f"ram={ram_pct:.1f}% {cores_col}={cores_above}"
                 )
     except KeyboardInterrupt:
         print("\nStopped by user.")
 
-    for timestamp, cpu_avg, gpu_pct, cores_above in rows:
-        sheet.append([timestamp, round(cpu_avg, 2), gpu_pct, cores_above])
+    for timestamp, cpu_avg, gpu_pct, ram_pct, cores_above in rows:
+        sheet.append([timestamp, round(cpu_avg, 2), gpu_pct, round(ram_pct, 2), cores_above])
+
+    if rows:
+        cpu_avg_mean = statistics.fmean(row[1] for row in rows)
+        gpu_values = [row[2] for row in rows if row[2] is not None]
+        gpu_avg = statistics.fmean(gpu_values) if gpu_values else None
+        ram_avg = statistics.fmean(row[3] for row in rows)
+        cores_sum = sum(row[4] for row in rows)
+        sheet.append(
+            [
+                "SUMMARY",
+                round(cpu_avg_mean, 2),
+                round(gpu_avg, 2) if gpu_avg is not None else None,
+                round(ram_avg, 2),
+                cores_sum,
+            ]
+        )
 
     workbook.save(output_path)
     print(f"Saved {len(rows)} samples to {output_path}")
 
     if rows:
         gpu_values = [row[2] for row in rows if row[2] is not None]
+        print(
+            f"Summary row: cpu_avg_pct={statistics.fmean(row[1] for row in rows):.2f}% "
+            f"ram_pct={statistics.fmean(row[3] for row in rows):.2f}% "
+            f"{cores_col}={sum(row[4] for row in rows)}"
+        )
         if gpu_values:
             print(
                 f"GPU stats: min={min(gpu_values):.1f}% "
