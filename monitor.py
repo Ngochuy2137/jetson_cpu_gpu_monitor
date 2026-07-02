@@ -65,6 +65,15 @@ def read_gpu_percent(gpu_load_path: Path | None) -> float | None:
         return None
 
 
+def get_cpu_count() -> int:
+    return psutil.cpu_count() or 1
+
+
+def normalize_process_cpu_to_system_scale(process_cpu_pct: float) -> float:
+    """Convert psutil process CPU (% of one core, sum of threads) to system avg scale."""
+    return process_cpu_pct / get_cpu_count()
+
+
 def get_cpu_per_core() -> list[float]:
     return list(psutil.cpu_percent(interval=0, percpu=True))
 
@@ -147,7 +156,7 @@ def sample_process_resource(
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             process_cache.pop(pid, None)
             continue
-    return cpu_total, ram_gb
+    return normalize_process_cpu_to_system_scale(cpu_total), ram_gb
 
 
 def prime_process_cpu_counters(
@@ -311,8 +320,13 @@ def main() -> int:
 
     print(
         f"Sampling at {args.hz:g} Hz, threshold={args.threshold:g}%%, "
-        f"output={output_path}"
+        f"cpu_count={get_cpu_count()}, output={output_path}"
     )
+    if target_processes:
+        print(
+            "Target process CPU uses the same scale as system_cpu_avg_pct "
+            "(psutil process CPU / cpu_count)."
+        )
     for name in target_processes:
         pids = find_pids_by_ros2_node(name)
         if pids:
