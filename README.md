@@ -1,4 +1,4 @@
-# Jetson CPU/GPU Monitor
+# Jetson Resource Monitor
 
 Log system and per-process resource usage to an Excel file.
 
