@@ -11,6 +11,7 @@ GPU load is read from Jetson sysfs (value / 10 = percent).
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 import sys
 import time
@@ -77,6 +78,95 @@ def count_cores_above(per_core: list[float], threshold: float) -> int:
     return sum(1 for value in per_core if value > threshold)
 
 
+def find_pids_by_cmdline(fragment: str) -> list[int]:
+    fragment_lower = fragment.lower()
+    own_pid = os.getpid()
+    pids: list[int] = []
+    for proc in psutil.process_iter(["pid", "cmdline", "exe"]):
+        pid = proc.info["pid"]
+        if pid == own_pid:
+            continue
+        cmdline = " ".join(proc.info["cmdline"] or [])
+        if fragment_lower not in cmdline.lower():
+            continue
+        exe = (proc.info["exe"] or "").lower()
+        if exe.endswith("/bash") or exe.endswith("/sh"):
+            continue
+        pids.append(pid)
+    return pids
+
+
+def normalize_ros2_node_name(node_name: str) -> str:
+    return node_name.strip().lstrip("/")
+
+
+def ros2_node_to_process_match(node_name: str) -> str:
+    """ROS2 passes the logical node name in process cmdline as __node:=NAME."""
+    return f"__node:={normalize_ros2_node_name(node_name)}"
+
+
+def find_pids_by_ros2_node(node_name: str) -> list[int]:
+    return find_pids_by_cmdline(ros2_node_to_process_match(node_name))
+
+
+def normalize_target_processes(names: list[str]) -> list[str]:
+    return [normalize_ros2_node_name(name) for name in names if name.strip()]
+
+
+def build_columns(threshold: float, target_processes: list[str]) -> list[str]:
+    cores_col = f"system_cores_above_{threshold:g}pct"
+    columns = [
+        "timestamp",
+        "system_cpu_avg_pct",
+        "system_gpu_pct",
+        "system_ram_pct",
+        cores_col,
+    ]
+    for name in target_processes:
+        columns.append(f"{name}_cpu_avg_pct")
+        columns.append(f"{name}_ram_gb")
+    return columns
+
+
+def sample_process_resource(
+    pids: list[int],
+    process_cache: dict[int, psutil.Process],
+) -> tuple[float, float]:
+    cpu_total = 0.0
+    ram_gb = 0.0
+
+    for pid in pids:
+        try:
+            proc = process_cache.get(pid)
+            if proc is None:
+                proc = psutil.Process(pid)
+                process_cache[pid] = proc
+                proc.cpu_percent(interval=None)
+                continue
+            cpu_total += proc.cpu_percent(interval=None)
+            ram_gb += proc.memory_info().rss / (1024**3)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            process_cache.pop(pid, None)
+            continue
+    return cpu_total, ram_gb
+
+
+def prime_process_cpu_counters(
+    pids: list[int],
+    process_cache: dict[int, psutil.Process],
+) -> None:
+    for pid in pids:
+        try:
+            proc = process_cache.get(pid)
+            if proc is None:
+                proc = psutil.Process(pid)
+                process_cache[pid] = proc
+            proc.cpu_percent(interval=None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            process_cache.pop(pid, None)
+            continue
+
+
 def default_output_path() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return Path(__file__).resolve().parent / f"cpu_gpu_monitor_{stamp}.xlsx"
@@ -112,7 +202,57 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output .xlsx path (default: cpu_gpu_monitor_<timestamp>.xlsx in package dir)",
     )
+    parser.add_argument(
+        "--target-processes",
+        dest="target_processes",
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help=(
+            "ROS2 node name(s) to track. Example: "
+            "--target-processes slam_toolbox_localization slam_toolbox_mapping. "
+            "PID is resolved from process cmdline __node:=NAME"
+        ),
+    )
     return parser.parse_args()
+
+
+def round_cell(column: str, value: object) -> object:
+    if column == "timestamp":
+        return value
+    if column.endswith("_pct"):
+        return round(float(value), 2)
+    if column.endswith("_gb"):
+        return round(float(value), 3)
+    if column.startswith("system_cores_above_"):
+        return int(value)
+    return value
+
+
+def build_summary_row(columns: list[str], rows: list[dict[str, object]]) -> list[object]:
+    summary: list[object] = []
+    for column in columns:
+        if column == "timestamp":
+            summary.append("SUMMARY")
+            continue
+
+        values = [row[column] for row in rows]
+        if column == "system_gpu_pct":
+            gpu_values = [float(value) for value in values if value is not None]
+            summary.append(
+                round(statistics.fmean(gpu_values), 2) if gpu_values else None
+            )
+        elif column.startswith("system_cores_above_"):
+            summary.append(sum(int(value) for value in values))
+        elif column.endswith("_pct") or column.endswith("_gb") or column == "system_ram_pct":
+            summary.append(
+                round(statistics.fmean(float(value) for value in values), 3)
+                if column.endswith("_gb")
+                else round(statistics.fmean(float(value) for value in values), 2)
+            )
+        else:
+            summary.append(None)
+    return summary
 
 
 def main() -> int:
@@ -124,18 +264,27 @@ def main() -> int:
         print("--threshold must be between 0 and 100", file=sys.stderr)
         return 1
 
+    target_processes = (
+        normalize_target_processes(args.target_processes)
+        if args.target_processes
+        else []
+    )
+    columns = build_columns(args.threshold, target_processes)
+    system_cores_col = f"system_cores_above_{args.threshold:g}pct"
+
     interval = 1.0 / args.hz
     output_path = args.output or default_output_path()
     gpu_load_path = find_gpu_load_path()
-    cores_col = f"cores_above_{args.threshold:g}pct"
+    process_cache: dict[int, psutil.Process] = {}
 
     if gpu_load_path is None:
         print("Warning: GPU load sysfs not found; GPU column will be empty.", file=sys.stderr)
     else:
         print(f"GPU load path: {gpu_load_path}")
 
-    # Prime psutil counters (same pattern as main_controller resource monitor).
     psutil.cpu_percent(interval=0, percpu=True)
+    for name in target_processes:
+        prime_process_cpu_counters(find_pids_by_ros2_node(name), process_cache)
 
     workbook = Workbook()
     sheet = workbook.active
@@ -147,12 +296,16 @@ def main() -> int:
             f"--hz={args.hz:g}",
             f"--threshold={args.threshold:g}",
             f"duration={duration_text}",
-            "",
+            (
+                "--target-processes=" + ",".join(target_processes)
+                if target_processes
+                else ""
+            ),
         ]
     )
-    sheet.append(["timestamp", "cpu_avg_pct", "gpu_pct", "ram_pct", cores_col])
+    sheet.append(columns)
 
-    rows: list[tuple[str, float, float | None, float, int]] = []
+    rows: list[dict[str, object]] = []
     start = time.monotonic()
     next_sample = start
     sample_count = 0
@@ -161,6 +314,19 @@ def main() -> int:
         f"Sampling at {args.hz:g} Hz, threshold={args.threshold:g}%%, "
         f"output={output_path}"
     )
+    for name in target_processes:
+        pids = find_pids_by_ros2_node(name)
+        if pids:
+            print(
+                f"Tracking '/{name}': "
+                f"cmdline match '{ros2_node_to_process_match(name)}', PIDs={pids}"
+            )
+        else:
+            print(
+                f"Warning: no process matched '/{name}'; "
+                "its columns will stay empty until a match appears.",
+                file=sys.stderr,
+            )
 
     try:
         while True:
@@ -173,57 +339,74 @@ def main() -> int:
                 continue
 
             per_core = get_cpu_per_core()
-            cpu_avg = statistics.fmean(per_core) if per_core else 0.0
-            gpu_pct = read_gpu_percent(gpu_load_path)
-            ram_pct = get_ram_percent()
-            cores_above = count_cores_above(per_core, args.threshold)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            row: dict[str, object] = {
+                "timestamp": timestamp,
+                "system_cpu_avg_pct": statistics.fmean(per_core) if per_core else 0.0,
+                "system_gpu_pct": read_gpu_percent(gpu_load_path),
+                "system_ram_pct": get_ram_percent(),
+                system_cores_col: count_cores_above(per_core, args.threshold),
+            }
 
-            rows.append((timestamp, cpu_avg, gpu_pct, ram_pct, cores_above))
+            for name in target_processes:
+                pids = find_pids_by_ros2_node(name)
+                cpu_pct, ram_gb = sample_process_resource(pids, process_cache)
+                row[f"{name}_cpu_avg_pct"] = cpu_pct
+                row[f"{name}_ram_gb"] = ram_gb
+
+            rows.append(row)
             sample_count += 1
             next_sample += interval
 
             if sample_count % int(max(args.hz, 1)) == 0:
-                gpu_text = "n/a" if gpu_pct is None else f"{gpu_pct:.1f}"
-                print(
-                    f"[{timestamp}] cpu_avg={cpu_avg:.1f}% gpu={gpu_text}% "
-                    f"ram={ram_pct:.1f}% {cores_col}={cores_above}"
+                gpu_pct = row["system_gpu_pct"]
+                gpu_text = "n/a" if gpu_pct is None else f"{float(gpu_pct):.1f}"
+                line = (
+                    f"[{timestamp}] system_cpu={float(row['system_cpu_avg_pct']):.1f}% "
+                    f"system_gpu={gpu_text}% "
+                    f"system_ram={float(row['system_ram_pct']):.1f}% "
+                    f"{system_cores_col}={row[system_cores_col]}"
                 )
+                for name in target_processes:
+                    line += (
+                        f" {name}_cpu={float(row[f'{name}_cpu_avg_pct']):.1f}%"
+                        f" {name}_ram={float(row[f'{name}_ram_gb']):.3f}GB"
+                    )
+                print(line)
     except KeyboardInterrupt:
         print("\nStopped by user.")
 
-    for timestamp, cpu_avg, gpu_pct, ram_pct, cores_above in rows:
-        sheet.append([timestamp, round(cpu_avg, 2), gpu_pct, round(ram_pct, 2), cores_above])
+    for row in rows:
+        sheet.append([round_cell(column, row[column]) for column in columns])
 
     if rows:
-        cpu_avg_mean = statistics.fmean(row[1] for row in rows)
-        gpu_values = [row[2] for row in rows if row[2] is not None]
-        gpu_avg = statistics.fmean(gpu_values) if gpu_values else None
-        ram_avg = statistics.fmean(row[3] for row in rows)
-        cores_sum = sum(row[4] for row in rows)
-        sheet.append(
-            [
-                "SUMMARY",
-                round(cpu_avg_mean, 2),
-                round(gpu_avg, 2) if gpu_avg is not None else None,
-                round(ram_avg, 2),
-                cores_sum,
-            ]
-        )
+        sheet.append(build_summary_row(columns, rows))
 
     workbook.save(output_path)
     print(f"Saved {len(rows)} samples to {output_path}")
 
     if rows:
-        gpu_values = [row[2] for row in rows if row[2] is not None]
+        summary_row = build_summary_row(columns, rows)
+        summary_map = dict(zip(columns, summary_row))
         print(
-            f"Summary row: cpu_avg_pct={statistics.fmean(row[1] for row in rows):.2f}% "
-            f"ram_pct={statistics.fmean(row[3] for row in rows):.2f}% "
-            f"{cores_col}={sum(row[4] for row in rows)}"
+            "Summary row: "
+            f"system_cpu_avg_pct={summary_map['system_cpu_avg_pct']}% "
+            f"system_ram_pct={summary_map['system_ram_pct']}% "
+            f"{system_cores_col}={summary_map[system_cores_col]}"
         )
+        for name in target_processes:
+            print(
+                f"  {name}: cpu_avg_pct={summary_map[f'{name}_cpu_avg_pct']}% "
+                f"ram_gb={summary_map[f'{name}_ram_gb']}"
+            )
+        gpu_values = [
+            float(row["system_gpu_pct"])
+            for row in rows
+            if row["system_gpu_pct"] is not None
+        ]
         if gpu_values:
             print(
-                f"GPU stats: min={min(gpu_values):.1f}% "
+                f"System GPU stats: min={min(gpu_values):.1f}% "
                 f"max={max(gpu_values):.1f}% "
                 f"avg={statistics.fmean(gpu_values):.1f}%"
             )
